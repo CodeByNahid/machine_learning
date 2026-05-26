@@ -1,0 +1,402 @@
+#START - ESSENTIAL LIBRARIES
+import os
+import numpy as np
+import tensorflow as tf
+from sklearn.metrics import confusion_matrix, accuracy_score, recall_score, precision_score, f1_score, roc_curve, roc_auc_score, auc, precision_recall_curve
+from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
+from tensorflow.keras.applications import DenseNet121
+from tensorflow.keras.preprocessing.image import load_img, img_to_array
+import cv2
+import matplotlib.pyplot as plt
+import seaborn as sns
+from PIL import UnidentifiedImageError
+from imblearn.over_sampling import SMOTE  # Import SMOTE for static augmentation
+import matplotlib.ticker as ticker  # Added import for ticker
+from sklearn.metrics import classification_report
+import shap
+import lime
+import lime.lime_tabular
+from lime.lime_image import LimeImageExplainer
+from sklearn.inspection import permutation_importance
+from skimage.segmentation import mark_boundaries
+from tensorflow.keras.callbacks import Callback
+#END - ESSENTIAL LIBRARIES
+
+
+#START - DATASET UPLOAD 
+# 1. INSERT YOUR DATASET DIRECTORY HERE
+data_dir = 'Your Dataset Link'
+classes = ['0', '1']  # Updated to 0 - Normal, 1 - Stroke/CHF
+#END - DATASET UPLOAD 
+
+
+#START - IMAGE PREPROCESSING
+# Preprocessing: Load images, apply CLAHE and Laplacian filter
+def apply_clahe(image):
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2Lab)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    cl = clahe.apply(l)
+    limg = cv2.merge((cl, a, b))
+    return cv2.cvtColor(limg, cv2.COLOR_Lab2BGR)
+
+def apply_laplacian_filter(image):
+    laplacian = cv2.Laplacian(image, cv2.CV_64F)
+    sharpened = np.uint8(np.clip(image - laplacian, 0, 255))
+    return sharpened
+
+def preprocess_image(img_path):
+    try:
+        img = load_img(img_path, target_size=(224, 224))
+        img_array = img_to_array(img)
+        img_array = apply_clahe(img_array.astype('uint8'))
+        img_array = apply_laplacian_filter(img_array)
+        return img_array
+    except UnidentifiedImageError:
+        print(f"Skipping file {img_path} - Unidentified image format.")
+        return None
+
+def load_and_preprocess_images(data_dir, classes):
+    images = []
+    labels = []
+    
+    for label, class_name in enumerate(classes):
+        folder = os.path.join(data_dir, class_name)
+        print(f"Looking for images in: {folder}")  # Debugging: print the folder path
+        if not os.path.exists(folder):
+            print(f"Error: The folder {folder} does not exist.")
+            continue  # Skip if the folder doesn't exist
+        for img_name in os.listdir(folder):
+            img_path = os.path.join(folder, img_name)
+            if img_name.lower().endswith(('.png', '.jpg', '.jpeg')):  # Check for image formats
+                img_array = preprocess_image(img_path)
+                if img_array is not None:  # Only append if preprocessing was successful
+                    images.append(img_array)
+                    labels.append(label)
+            else:
+                print(f"Skipping file {img_path} - Unsupported format.")
+    
+    images = np.array(images)
+    labels = np.array(labels)
+    
+    return images, labels
+
+images, labels = load_and_preprocess_images(data_dir, classes)
+
+# Flatten the images for SMOTE
+X_flatten = images.reshape(images.shape[0], -1)
+
+# Apply SMOTE to balance the dataset
+smote = SMOTE(random_state=42)
+X_flatten_resampled, y_resampled = smote.fit_resample(X_flatten, labels)
+
+# Reshape back to image dimensions
+X_resampled = X_flatten_resampled.reshape(-1, 224, 224, 3)
+
+# Split the data into training (80%) and testing (20%)
+X_train, X_test, y_train, y_test = train_test_split(X_resampled, y_resampled, test_size=0.2, random_state=42, stratify=y_resampled)
+
+# Normalize data
+X_train = X_train / 255.0
+X_test = X_test / 255.0
+#END - IMAGE PREPROCESSING
+
+
+#START - FEATURE EXTRACTION
+# Load DenseNet121 model with top layers
+densenet_model = DenseNet121(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+
+# Fine-tune more layers
+for layer in densenet_model.layers[-80:]:  # Fine-tune more layers
+    layer.trainable = True
+#END - FEATURE EXTRACTION
+
+
+#START - CLASSIFICATION
+# Add custom top layers
+model = tf.keras.Sequential([
+    densenet_model,
+    tf.keras.layers.GlobalAveragePooling2D(),
+    tf.keras.layers.Dense(512, activation='relu'),  # Increased the size of dense layer
+    tf.keras.layers.BatchNormalization(),
+    tf.keras.layers.Dropout(0.25),
+    tf.keras.layers.Dense(1, activation='sigmoid')
+])
+
+# Compile the model with a more gradual learning rate scheduler
+initial_lr = 1e-4
+lr_schedule = tf.keras.callbacks.LearningRateScheduler(lambda epoch: initial_lr * (1.04 ** epoch))
+
+model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=initial_lr), 
+              loss='binary_crossentropy', 
+              metrics=['accuracy'])
+
+# Compute class weights
+class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
+class_weights_dict = {i: class_weights[i] for i in range(len(class_weights))}
+
+# Callbacks: Early stopping and Model checkpoint
+early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=20, min_delta=1e-3, restore_best_weights=True)
+model_checkpoint = tf.keras.callbacks.ModelCheckpoint('best_model.keras', save_best_only=True)
+
+# Store precision, recall, and f1 score for each epoch
+precision_scores = []
+recall_scores = []
+f1_scores = []
+
+class MetricsCallback(Callback):
+    def __init__(self, val_data):
+        super().__init__()
+        self.validation_data = val_data
+
+    def on_epoch_end(self, epoch, logs=None):
+        X_val, y_val = self.validation_data
+        y_pred = self.model.predict(X_val)
+        y_pred_binary = (y_pred > 0.5).astype(int)
+        
+        precision = precision_score(y_val, y_pred_binary)
+        recall = recall_score(y_val, y_pred_binary)
+        f1 = f1_score(y_val, y_pred_binary)
+        
+        # Log metrics
+        print(f"Epoch {epoch + 1} - Precision: {precision:.4f}, Recall: {recall:.4f}, F1 Score: {f1:.4f}")
+        
+        # Store metrics
+        precision_scores.append(precision)
+        recall_scores.append(recall)
+        f1_scores.append(f1)
+        
+# Use MetricsCallback
+metrics_callback = MetricsCallback(val_data=(X_test, y_test))
+
+# Train the model
+history = model.fit(
+    X_train, y_train,
+    epochs=31,
+    validation_data=(X_test, y_test),
+    class_weight=class_weights_dict,
+    callbacks=[early_stopping, model_checkpoint, lr_schedule, metrics_callback]
+)
+
+# Predict on test set
+y_pred_prob = model.predict(X_test).ravel()  # Probabilities
+y_pred = (y_pred_prob > 0.5).astype(int)  # Binary predictions
+#END - CLASSIFICATION
+
+
+#START - PRINT PERMORMANCE METRICS
+# Compute class-wise metrics
+def compute_classwise_metrics(y_true, y_pred, y_prob, num_classes=2):
+    cm = confusion_matrix(y_true, y_pred)
+    classwise_accuracy = cm.diagonal() / cm.sum(axis=1)
+    
+    classwise_auc = []
+    for i in range(num_classes):
+        # Create binary labels for the current class
+        y_true_binary = (y_true == i).astype(int)
+        y_prob_binary = y_prob[:, i] if num_classes > 2 else y_prob
+        
+        # Compute ROC curve and AUC
+        fpr, tpr, _ = roc_curve(y_true_binary, y_prob_binary)
+        auc_value = auc(fpr, tpr)
+        classwise_auc.append(auc_value)
+    
+    return classwise_accuracy, classwise_auc, cm
+
+# Predictions
+y_pred_prob = model.predict(X_test)  # Probabilities
+y_pred = (y_pred_prob > 0.5).astype(int).ravel()  # Binary predictions for metrics
+if len(classes) > 2:
+    y_pred_prob_multiclass = model.predict_proba(X_test)
+
+# Compute overall metrics
+acc = accuracy_score(y_test, y_pred)
+recall = recall_score(y_test, y_pred, average='binary')
+precision = precision_score(y_test, y_pred, average='binary')
+f1 = f1_score(y_test, y_pred, average='binary')
+
+# Compute class-wise metrics
+classwise_acc, classwise_auc, cm = compute_classwise_metrics(
+    y_test, y_pred, y_pred_prob, num_classes=len(classes)
+)
+
+# Print metrics
+print("\nClass-wise Metrics:")
+for i, cls in enumerate(classes):
+    print(f"Class {cls}:")
+    print(f"  Accuracy: {classwise_acc[i]:.4f}")
+    print(f"  AUC: {classwise_auc[i]:.4f}")
+
+# Metrics
+cm = confusion_matrix(y_test, y_pred)
+acc = accuracy_score(y_test, y_pred)
+recall = recall_score(y_test, y_pred, average='binary')
+precision = precision_score(y_test, y_pred, average='binary')
+f1 = f1_score(y_test, y_pred, average='binary')
+
+# AUC and ROC curve
+fpr, tpr, thresholds = roc_curve(y_test, y_pred_prob)
+roc_auc = auc(fpr, tpr)
+
+# Print metrics
+print("Confusion Matrix:")
+print(cm)
+print(f"Accuracy: {acc}")
+print(f"Recall: {recall}")
+print(f"Precision: {precision}")
+print(f"F1 Score: {f1}")
+print(f"AUC: {roc_auc}")
+
+# Add class-wise metrics (accuracy, recall, precision, F1-score, AUC)
+print("\nClass-wise metrics:")
+class_report = classification_report(y_test, y_pred, target_names=classes)
+print(class_report)
+#END - PRINT PERMORMANCE METRICS
+
+
+#REST OF THE PARTS - PLOTTING CURVES
+# For class-wise AUC
+fpr_class, tpr_class, _ = roc_curve(y_test, y_pred_prob, pos_label=1)
+roc_auc_class = auc(fpr_class, tpr_class)
+print(f"Class-wise AUC (Class 1): {roc_auc_class}")
+
+# Assuming 'cm' is your confusion matrix with actual counts
+plt.figure(figsize=(8, 8))  # Square-sized plot
+
+# 2. PUT YOUR OWN CLASS NAMES HERE
+# Confusion Matrix Plot with automatic ticks for the color bar
+ax = sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                 xticklabels=['class 0', 'class 1'], 
+                 yticklabels=['class 0', 'class 1'], 
+                 annot_kws={"size": 24, "weight": "bold"}, 
+                 cbar=True, vmin=0, vmax=np.max(cm))  # Ensure vmax is set dynamically to the max value in the confusion matrix
+
+# Plot the confusion matrix and ROC curve as before.
+# Set the labels and title
+cbar = ax.collections[0].colorbar
+cbar.ax.tick_params(labelsize=16)  # Increase the size of color bar ticks
+plt.title('Confusion Matrix', fontsize=18)
+plt.ylabel('True Label', fontsize=20)
+plt.xlabel('Predicted Label', fontsize=20)
+plt.xticks(fontsize=16)
+plt.yticks(fontsize=16)
+plt.gca().yaxis.label.set_size(20)  # Larger y-axis label
+plt.gca().xaxis.label.set_size(20)  # Larger x-axis label
+#plt.grid(True, linewidth=0.5)  # Add thin grid lines
+plt.savefig('/kaggle/working/confusion_matrix_with_counts.pdf', format='pdf', bbox_inches='tight')
+plt.show()
+
+# If you want to visualize AUC for both classes separately
+fpr_0, tpr_0, _ = roc_curve(y_test, y_pred_prob, pos_label=0)
+roc_auc_0 = auc(fpr_0, tpr_0)
+
+# ROC Curve Plot
+plt.figure(figsize=(8, 8))  # Square-sized plot
+plt.plot(fpr, tpr, color='darkorange', lw=4, label=f'ROC curve (area = {roc_auc:.2f})')  # Thicker ROC curve
+plt.plot([0, 1], [0, 1], color='navy', lw=3, linestyle='--')  # Thicker dashed reference line
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate', fontsize=20)
+plt.ylabel('True Positive Rate', fontsize=20)
+plt.title('Receiver Operating Characteristic', fontsize=20)
+plt.xticks(fontsize=16)
+plt.yticks(fontsize=16)
+plt.legend(loc='lower right', fontsize=17)
+plt.gca().spines['top'].set_linewidth(2)  # Thicker top border
+plt.gca().spines['right'].set_linewidth(2)  # Thicker right border
+plt.grid(True, linewidth=0.5)  # Add thin grid lines
+plt.savefig('/kaggle/working/roc_curve.pdf', format='pdf', bbox_inches='tight')
+plt.show()
+
+# Training and Validation Accuracy/Loss Plot
+plt.figure(figsize=(8, 8))  # Square-sized plot
+
+# Plot training and validation accuracy
+plt.plot(history.history['accuracy'], label='Train Accuracy', color='blue', linestyle='--', linewidth=4)  # Thicker curve
+plt.plot(history.history['val_accuracy'], label='Validation Accuracy', color='green', linewidth=4)  # Thicker curve
+
+# Plot training and validation loss
+plt.plot(history.history['loss'], label='Train Loss', color='red', linestyle='--', linewidth=4)  # Thicker curve
+plt.plot(history.history['val_loss'], label='Validation Loss', color='purple', linewidth=4)  # Thicker curve
+
+plt.title('Training and Validation Accuracy & Loss', fontsize=20)
+plt.xlabel('Epochs', fontsize=20)
+plt.ylabel('Accuracy/Loss', fontsize=20)  # Single y-axis label for both metrics
+plt.xticks(fontsize=16)
+plt.yticks(fontsize=16)
+plt.legend(fontsize=14, loc='upper left')  # Larger legend text
+plt.grid(True, linewidth=0.5)  # Add thin grid lines
+plt.savefig('/kaggle/working/accuracy_loss.pdf', format='pdf', bbox_inches='tight')
+
+# Calculate Precision-Recall curve
+precision, recall, thresholds_pr = precision_recall_curve(y_test, y_pred_prob)
+
+# Plot Precision vs Recall Curve
+plt.figure(figsize=(8, 8))  # Square-sized plot
+plt.plot(recall, precision, color='blue', lw=4, label='Precision-Recall Curve')  # Thicker curve
+plt.xlabel('Recall', fontsize=20)
+plt.ylabel('Precision', fontsize=20)
+plt.title('Precision-Recall Curve', fontsize=20)
+plt.xticks(fontsize=16)
+plt.yticks(fontsize=16)
+plt.legend(loc='lower left', fontsize=17)
+plt.gca().spines['top'].set_linewidth(2)  # Thicker top border
+plt.gca().spines['right'].set_linewidth(2)  # Thicker right border
+plt.grid(True, linewidth=0.5)  # Add thin grid lines
+plt.savefig('/kaggle/working/precision_recall_curve.pdf', format='pdf', bbox_inches='tight')
+plt.show()
+
+# Learning Rate vs Loss Plot
+# Use the learning rate history from the lr_schedule
+lrs = [initial_lr * (1.05 ** epoch) for epoch in range(len(history.history['loss']))]
+
+plt.figure(figsize=(8, 8))  # Square-sized plot
+plt.plot(lrs, history.history['loss'], label='Train Loss', color='red', lw=4, linestyle='--')  # Thicker curve for train loss
+plt.plot(lrs, history.history['val_loss'], label='Validation Loss', color='purple', lw=4)  # Thicker curve for validation loss
+
+plt.title('Loss vs Learning Rate', fontsize=20)
+plt.xlabel('Learning Rate (× 10⁻⁴)', fontsize=20)
+plt.ylabel('Loss', fontsize=20)
+
+# Ensure scientific notation for all x-ticks
+bx = plt.gca()  # Get the current axes
+bx.xaxis.set_major_formatter(ticker.ScalarFormatter(useMathText=True))  # Use math text for better formatting
+bx.ticklabel_format(style='sci', axis='x', scilimits=(0, 0))  # Force scientific notation for x-axis
+
+# Rotate and set font size for x-ticks
+plt.xticks(fontsize=16, rotation=45)  # Rotate by 45 degrees for better spacing
+plt.yticks(fontsize=16)
+
+plt.legend(loc='upper right', fontsize=14)
+plt.grid(True, which='both', axis='both', linestyle='-', linewidth=0.5)  # Thin grid lines for both axes
+plt.savefig('/kaggle/working/lr_vs_loss.pdf', format='pdf', bbox_inches='tight')
+plt.show()
+
+# Plot Precision, Recall, and F1-score vs Epoch
+epochs_range = range(1, len(precision_scores) + 1)
+
+
+plt.figure(figsize=(8, 8))  # Square-sized plot
+
+# Plot Precision, Recall, and F1-Score across epochs
+plt.plot(precision_scores, label='Precision', color='blue', linestyle='--', linewidth=4)  # Thicker curve
+plt.plot(recall_scores, label='Recall', color='green', linewidth=4)  # Thicker curve
+plt.plot(f1_scores, label='F1-Score', color='purple', linewidth=4)  # Thicker curve
+
+# Title, labels, and ticks with larger fonts
+plt.title('Precision, Recall, and F1-Score vs Epoch', fontsize=20)
+plt.xlabel('Epochs', fontsize=20)
+plt.ylabel('Score', fontsize=20)
+plt.xticks(fontsize=16)
+plt.yticks(fontsize=16)
+
+# Add legend
+plt.legend(fontsize=14, loc='lower right')
+
+# Save the figure as a PDF
+plt.grid(True, linewidth=0.5)  # Add thin grid lines
+plt.savefig('/kaggle/working/precision_recall_f1_vs_epoch.pdf', format='pdf', bbox_inches='tight')
+
+# Show the plot
+plt.show()
